@@ -1,0 +1,1 @@
+libncnn.a
