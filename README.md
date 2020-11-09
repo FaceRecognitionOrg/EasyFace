@@ -102,7 +102,8 @@ Total time is about 410ms on Core i7 CPU.
 - 人脸质量评估
 - 人脸活体检测
 - 性别年龄预测
-- [高效的人脸搜索]（https://cloud.google.com/solutions/machine-learning/building-real-time-embeddings-similarity-matching-system?hl=zh-cn#hashing-based_approaches）
+
+[高效的人脸搜索](https://cloud.google.com/solutions/machine-learning/building-real-time-embeddings-similarity-matching-system?hl=zh-cn#hashing-based_approaches)
 
 
 
