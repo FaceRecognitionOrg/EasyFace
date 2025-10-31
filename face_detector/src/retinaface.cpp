@@ -6,6 +6,8 @@
 
 #include <assert.h>
 #include <float.h>
+#include <algorithm>
+#include <cmath>
 #include <stdio.h>
 #include <string>
 #include <vector>
@@ -38,7 +40,6 @@ class Retinaface::Impl
 
     private:
         static inline float intersection_area(const _FaceObject& a, const _FaceObject& b);
-        static void qsort_descent_inplace(std::vector<_FaceObject>& faceobjects, int left, int right);
         static void qsort_descent_inplace(std::vector<_FaceObject>& faceobjects);
         static void nms_sorted_bboxes(const std::vector<_FaceObject>& faceobjects, std::vector<int>& picked, float nms_threshold);
         static ncnn::Mat generate_anchors(int base_size, const ncnn::Mat& ratios, const ncnn::Mat& scales);
@@ -197,16 +198,17 @@ std::vector<FaceObject> Retinaface::Impl::detect(const cv::Mat &bgr)
         _faceobjects[i].rect.height = y1 - y0;
     }
 
-    for(auto _faceobject : _faceobjects)
+    faceobjects.reserve(_faceobjects.size());
+    for(const auto& _faceobject : _faceobjects)
     {
-        FaceObject faceobject;
+        FaceObject& faceobject = faceobjects.emplace_back();
         faceobject.rect = _faceobject.rect;
         faceobject.prob = _faceobject.prob;
+        faceobject.landmark.resize(5);
         for(int i = 0; i < 5; ++i)
         {
-            faceobject.landmark.push_back(_faceobject.landmark[i]);
+            faceobject.landmark[i] = _faceobject.landmark[i];
         }
-        faceobjects.push_back(faceobject);
     }
 
     return faceobjects;
@@ -219,49 +221,15 @@ float Retinaface::Impl::intersection_area(const _FaceObject& a, const _FaceObjec
 }
 
 
-void Retinaface::Impl::qsort_descent_inplace(std::vector<_FaceObject>& faceobjects, int left, int right)
-{
-    int i = left;
-    int j = right;
-    float p = faceobjects[(left + right) / 2].prob;
-
-    while (i <= j)
-    {
-        while (faceobjects[i].prob > p)
-            i++;
-
-        while (faceobjects[j].prob < p)
-            j--;
-
-        if (i <= j)
-        {
-            // swap
-            std::swap(faceobjects[i], faceobjects[j]);
-
-            i++;
-            j--;
-        }
-    }
-
-    #pragma omp parallel sections
-    {
-        #pragma omp section
-        {
-            if (left < j) qsort_descent_inplace(faceobjects, left, j);
-        }
-        #pragma omp section
-        {
-            if (i < right) qsort_descent_inplace(faceobjects, i, right);
-        }
-    }
-}
-
 void Retinaface::Impl::qsort_descent_inplace(std::vector<_FaceObject>& faceobjects)
 {
-    if (faceobjects.empty())
+    if (faceobjects.size() <= 1)
         return;
 
-    qsort_descent_inplace(faceobjects, 0, faceobjects.size() - 1);
+    std::sort(faceobjects.begin(), faceobjects.end(), [](const _FaceObject& lhs, const _FaceObject& rhs)
+    {
+        return lhs.prob > rhs.prob;
+    });
 }
 
 
@@ -270,6 +238,7 @@ void Retinaface::Impl::nms_sorted_bboxes(const std::vector<_FaceObject>& faceobj
     picked.clear();
 
     const int n = faceobjects.size();
+    picked.reserve(n);
 
     std::vector<float> areas(n);
     for (int i = 0; i < n; i++)
@@ -281,17 +250,24 @@ void Retinaface::Impl::nms_sorted_bboxes(const std::vector<_FaceObject>& faceobj
     {
         const _FaceObject& a = faceobjects[i];
 
-        int keep = 1;
-        for (int j = 0; j < (int)picked.size(); j++)
+        bool keep = true;
+        for (int idx : picked)
         {
-            const _FaceObject& b = faceobjects[picked[j]];
+            const _FaceObject& b = faceobjects[idx];
 
-            // intersection over union
-            float inter_area = intersection_area(a, b);
-            float union_area = areas[i] + areas[picked[j]] - inter_area;
-            //             float IoU = inter_area / union_area
+            const float inter_area = intersection_area(a, b);
+            if (inter_area <= 0.f)
+                continue;
+
+            const float union_area = areas[i] + areas[idx] - inter_area;
+            if (union_area <= 0.f)
+                continue;
+
             if (inter_area / union_area > nms_threshold)
-                keep = 0;
+            {
+                keep = false;
+                break;
+            }
         }
 
         if (keep)
@@ -345,6 +321,12 @@ void Retinaface::Impl::generate_proposals(const ncnn::Mat& anchors, int feat_str
     // generate face proposal from bbox deltas and shifted anchors
     const int num_anchors = anchors.h;
 
+    const size_t max_proposals = static_cast<size_t>(num_anchors) * w * h;
+    if (max_proposals > 0)
+    {
+        faceobjects.reserve(faceobjects.size() + max_proposals);
+    }
+
     for (int q = 0; q < num_anchors; q++)
     {
         const float* anchor = anchors.row(q);
@@ -354,67 +336,92 @@ void Retinaface::Impl::generate_proposals(const ncnn::Mat& anchors, int feat_str
         const ncnn::Mat landmark = landmark_blob.channel_range(q * 10, 10);
 
         // shifted anchor
-        float anchor_y = anchor[1];
+        const float anchor_w = anchor[2] - anchor[0];
+        const float anchor_h = anchor[3] - anchor[1];
+        const float anchor_half_w = anchor_w * 0.5f;
+        const float anchor_half_h = anchor_h * 0.5f;
+        const float anchor_w_plus_one = anchor_w + 1.f;
+        const float anchor_h_plus_one = anchor_h + 1.f;
 
-        float anchor_w = anchor[2] - anchor[0];
-        float anchor_h = anchor[3] - anchor[1];
+        const float* score_ptr = score.channel(0);
+        const float* dx_ptr = bbox.channel(0);
+        const float* dy_ptr = bbox.channel(1);
+        const float* dw_ptr = bbox.channel(2);
+        const float* dh_ptr = bbox.channel(3);
+        const float* l0x_ptr = landmark.channel(0);
+        const float* l0y_ptr = landmark.channel(1);
+        const float* l1x_ptr = landmark.channel(2);
+        const float* l1y_ptr = landmark.channel(3);
+        const float* l2x_ptr = landmark.channel(4);
+        const float* l2y_ptr = landmark.channel(5);
+        const float* l3x_ptr = landmark.channel(6);
+        const float* l3y_ptr = landmark.channel(7);
+        const float* l4x_ptr = landmark.channel(8);
+        const float* l4y_ptr = landmark.channel(9);
 
         for (int i = 0; i < h; i++)
         {
-            float anchor_x = anchor[0];
+            const float anchor_y = anchor[1] + feat_stride * i;
+            const float cy = anchor_y + anchor_half_h;
 
+            float anchor_x = anchor[0];
             for (int j = 0; j < w; j++)
             {
-                int index = i * w + j;
-
-                float prob = score[index];
+                const float prob = *score_ptr++;
 
                 if (prob >= prob_threshold)
                 {
-                    // apply center size
-                    float dx = bbox.channel(0)[index];
-                    float dy = bbox.channel(1)[index];
-                    float dw = bbox.channel(2)[index];
-                    float dh = bbox.channel(3)[index];
+                    const float cx = anchor_x + anchor_half_w;
+                    const float dx = *dx_ptr;
+                    const float dy = *dy_ptr;
+                    const float dw = *dw_ptr;
+                    const float dh = *dh_ptr;
 
-                    float cx = anchor_x + anchor_w * 0.5f;
-                    float cy = anchor_y + anchor_h * 0.5f;
+                    const float pb_cx = cx + anchor_w * dx;
+                    const float pb_cy = cy + anchor_h * dy;
+                    const float pb_w = anchor_w * std::exp(dw);
+                    const float pb_h = anchor_h * std::exp(dh);
 
-                    float pb_cx = cx + anchor_w * dx;
-                    float pb_cy = cy + anchor_h * dy;
+                    const float x0 = pb_cx - pb_w * 0.5f;
+                    const float y0 = pb_cy - pb_h * 0.5f;
+                    const float x1 = pb_cx + pb_w * 0.5f;
+                    const float y1 = pb_cy + pb_h * 0.5f;
 
-                    float pb_w = anchor_w * exp(dw);
-                    float pb_h = anchor_h * exp(dh);
-
-                    float x0 = pb_cx - pb_w * 0.5f;
-                    float y0 = pb_cy - pb_h * 0.5f;
-                    float x1 = pb_cx + pb_w * 0.5f;
-                    float y1 = pb_cy + pb_h * 0.5f;
-
-                    _FaceObject obj;
+                    _FaceObject& obj = faceobjects.emplace_back();
                     obj.rect.x = x0;
                     obj.rect.y = y0;
                     obj.rect.width = x1 - x0 + 1;
                     obj.rect.height = y1 - y0 + 1;
-                    obj.landmark[0].x = cx + (anchor_w + 1) * landmark.channel(0)[index];
-                    obj.landmark[0].y = cy + (anchor_h + 1) * landmark.channel(1)[index];
-                    obj.landmark[1].x = cx + (anchor_w + 1) * landmark.channel(2)[index];
-                    obj.landmark[1].y = cy + (anchor_h + 1) * landmark.channel(3)[index];
-                    obj.landmark[2].x = cx + (anchor_w + 1) * landmark.channel(4)[index];
-                    obj.landmark[2].y = cy + (anchor_h + 1) * landmark.channel(5)[index];
-                    obj.landmark[3].x = cx + (anchor_w + 1) * landmark.channel(6)[index];
-                    obj.landmark[3].y = cy + (anchor_h + 1) * landmark.channel(7)[index];
-                    obj.landmark[4].x = cx + (anchor_w + 1) * landmark.channel(8)[index];
-                    obj.landmark[4].y = cy + (anchor_h + 1) * landmark.channel(9)[index];
+                    obj.landmark[0].x = cx + anchor_w_plus_one * (*l0x_ptr);
+                    obj.landmark[0].y = cy + anchor_h_plus_one * (*l0y_ptr);
+                    obj.landmark[1].x = cx + anchor_w_plus_one * (*l1x_ptr);
+                    obj.landmark[1].y = cy + anchor_h_plus_one * (*l1y_ptr);
+                    obj.landmark[2].x = cx + anchor_w_plus_one * (*l2x_ptr);
+                    obj.landmark[2].y = cy + anchor_h_plus_one * (*l2y_ptr);
+                    obj.landmark[3].x = cx + anchor_w_plus_one * (*l3x_ptr);
+                    obj.landmark[3].y = cy + anchor_h_plus_one * (*l3y_ptr);
+                    obj.landmark[4].x = cx + anchor_w_plus_one * (*l4x_ptr);
+                    obj.landmark[4].y = cy + anchor_h_plus_one * (*l4y_ptr);
                     obj.prob = prob;
-
-                    faceobjects.push_back(obj);
                 }
+
+                ++dx_ptr;
+                ++dy_ptr;
+                ++dw_ptr;
+                ++dh_ptr;
+                ++l0x_ptr;
+                ++l0y_ptr;
+                ++l1x_ptr;
+                ++l1y_ptr;
+                ++l2x_ptr;
+                ++l2y_ptr;
+                ++l3x_ptr;
+                ++l3y_ptr;
+                ++l4x_ptr;
+                ++l4y_ptr;
 
                 anchor_x += feat_stride;
             }
-
-            anchor_y += feat_stride;
         }
     }
 }
